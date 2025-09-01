@@ -17,7 +17,9 @@ translation_models = {
     ('en', 'uk'): "Helsinki-NLP/opus-mt-en-uk",
     ('uk', 'en'): "Helsinki-NLP/opus-mt-uk-en",
     ('en', 'pl'): "Helsinki-NLP/opus-mt-en-pl",
-    ('pl', 'en'): "Helsinki-NLP/opus-mt-pl-en"
+    ('pl', 'en'): "Helsinki-NLP/opus-mt-pl-en",
+    ('uk', 'pl'): "Helsinki-NLP/opus-mt-uk-pl",
+    ('pl', 'uk'): "Helsinki-NLP/opus-mt-pl-uk"
 }
 
 # Cache for models and tokenizers
@@ -47,10 +49,10 @@ def load_config():
 # Load model and tokenizer
 def get_translator(source_lang, target_lang):
     key = (source_lang, target_lang)
+    if key not in translation_models:
+        return None, None
     if key not in model_cache:
-        model_name = translation_models.get(key)
-        if not model_name:
-            return None, None
+        model_name = translation_models[key]
         tokenizer_cache[key] = MarianTokenizer.from_pretrained(model_name)
         model_cache[key] = MarianMTModel.from_pretrained(model_name)
     return model_cache[key], tokenizer_cache[key]
@@ -61,7 +63,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to LinguistBot!\n"
         "Use /setlang [en|uk|pl] to choose your target language.\n"
-        "In groups, I’ll attach personalized Translate buttons under foreign messages."
+        "I’ll attach personalized Translate buttons under foreign messages."
     )
 
 
@@ -70,7 +72,7 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     args = context.args
     if not args or args[0] not in supported_languages:
-        await update.message.reply_text("❗ Please specify a valid language: en, uk, or pl. Example: /setlang uk")
+        await update.message.reply_text("❗ Please specify a valid language: en, uk, or pl. Example: /setlang en")
         return
     user_preferences[user_id] = args[0]
     await update.message.reply_text(f"✅ Target language set to: {args[0]}")
@@ -89,54 +91,75 @@ async def translate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         return
 
-    # Build a list of buttons for all unique target languages
+    if source_lang not in supported_languages:
+        return  # Skip if source language is not supported
+
+    # Build a list of buttons for all unique target languages where model exists
     buttons = []
     seen_targets = set()
 
     for user_id, target_lang in user_preferences.items():
         if source_lang == target_lang:
-            continue  # No need to translate into the same language
+            continue  # Skip if already same language
         if target_lang in seen_targets:
             continue  # Avoid duplicate buttons
+        if (source_lang, target_lang) not in translation_models:
+            continue  # Skip if no model available
         seen_targets.add(target_lang)
 
         target_name = language_names.get(target_lang, target_lang)
         buttons.append(
             [InlineKeyboardButton(
                 f"🔤 Translate to {target_name}",
-                callback_data=f"translate|{source_lang}|{target_lang}|{text}"
+                callback_data=f"translate|{source_lang}|{target_lang}"
             )]
         )
 
     if buttons:
         keyboard = InlineKeyboardMarkup(buttons)
-        # Attach buttons under the original message
-        await message.reply_markup(reply_markup=keyboard)
+        await message.reply_text("Translate options:", reply_markup=keyboard)
 
 
 # Handle button press (ephemeral response)
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await query.answer()  # Dismiss the loading indicator
 
     try:
-        action, source_lang, target_lang, text = query.data.split("|", 3)
+        action, source_lang, target_lang = query.data.split("|", 2)
     except ValueError:
         await query.answer("⚠️ Error processing request.", show_alert=True)
         return
+
+    original_message = query.message.reply_to_message
+    if not original_message or not original_message.text:
+        await query.answer("⚠️ Original message not found.", show_alert=True)
+        return
+
+    text = original_message.text
 
     model, tokenizer = get_translator(source_lang, target_lang)
     if not model:
         await query.answer("⚠️ No model available for this language pair.", show_alert=True)
         return
 
-    inputs = tokenizer([text], return_tensors="pt", padding=True)
+    inputs = tokenizer([text], return_tensors="pt", padding=True, max_length=512, truncation=True)
     translated = model.generate(**inputs)
     translated_text = tokenizer.decode(translated[0], skip_special_tokens=True)
 
-    # Show translation ONLY to the user who clicked
-    await query.answer(
-        text=f"💬 ({source_lang} → {target_lang}): {translated_text}",
-        show_alert=False
+    # Construct message with link if possible
+    chat = query.message.chat
+    message_id = original_message.message_id
+    if chat.username:
+        link = f"https://t.me/{chat.username}/{message_id}"
+        msg = f"Original: {link}\n{text}\n\n💬 ({source_lang} → {target_lang}): {translated_text}"
+    else:
+        msg = f"Original: {text}\n\n💬 ({source_lang} → {target_lang}): {translated_text}"
+
+    # Show translation ONLY to the user who clicked, in their private chat
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text=msg
     )
 
 
